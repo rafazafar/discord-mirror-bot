@@ -17,6 +17,8 @@ This is a fork of the original Discord Mirror Bot created by [gitarynnn](https:/
 ## Features
 
 - **Message Forwarding**: Captures messages from specified channels and forwards them to associated webhooks.
+- **Global Mention/Reply Forwarding**: For channels not in `webhookMap.json`, forwards messages that mention you or reply to your messages to a global webhook.
+- **Hermes Assistant Support**: Optionally sends all mention/reply events to local Hermes and forwards the assistant summary to Telegram.
 - **Mention Replacement**: Replaces `@everyone` and `@here` mentions with a specific role mention so that you wont get spammed.
 - **Content Cleanup**: Removes role mentions, channel mentions, and message links.
 - **Embed Support**: Extracts and forwards embed data (titles, descriptions, images, etc.) customizable
@@ -33,7 +35,7 @@ This is a fork of the original Discord Mirror Bot created by [gitarynnn](https:/
 1. Clone the repository or download the code.
 2. Install dependencies: `npm install`
 3. Configure the bot:
-   - **Edit `config.js`**: Replace `YOUR_DISCORD_TOKEN_HERE` with your Discord account token and `YOUR_ROLE_ID_HERE` with the role ID to mention during `@everyone` and `@here` pings
+   - **Edit `config.js`**: Replace `YOUR_DISCORD_TOKEN_HERE` with your Discord account token, `YOUR_ROLE_ID_HERE` with the role ID to mention during `@everyone` and `@here` pings, and `YOUR_GLOBAL_WEBHOOK_URL_HERE` with your catch-all webhook URL
    - **Edit `webhookMap.json`**: Replace the placeholder values with your actual channel IDs and webhook URLs
 4. Start the bot using PM2 or directly with Node.js
 
@@ -44,7 +46,11 @@ This is a fork of the original Discord Mirror Bot created by [gitarynnn](https:/
 ```javascript
 module.exports = {
     token: 'YOUR_DISCORD_TOKEN_HERE',        // Your Discord account token
-    roleId: 'YOUR_ROLE_ID_HERE'              // Role ID to mention instead of @everyone/@here
+    roleId: 'YOUR_ROLE_ID_HERE',             // Role ID to mention instead of @everyone/@here
+    globalWebhookUrl: 'YOUR_GLOBAL_WEBHOOK_URL_HERE', // Webhook for mentions/replies outside mapped channels
+    enableHermesAssistant: false,                     // Set true to summarize mentions/replies with Hermes
+    hermesCommand: 'hermes',                          // Hermes CLI command
+    hermesSendTarget: 'telegram'                      // Target for `hermes send --to`
 };
 ```
 
@@ -69,6 +75,8 @@ module.exports = {
 2. **Edit the configuration files:**
    - Replace `YOUR_DISCORD_TOKEN_HERE` with your Discord account token
    - Replace `YOUR_ROLE_ID_HERE` with the role ID to mention instead of @everyone/@here
+   - Replace `YOUR_GLOBAL_WEBHOOK_URL_HERE` with your catch-all webhook URL
+   - Set `enableHermesAssistant` to `true` if Hermes is installed locally and Telegram is configured
    - Replace the placeholder channel IDs and webhook URLs with your actual values
 
 ### ⚠️ Important Security Notes
