@@ -1,35 +1,89 @@
-const Discord = require('discord.js-selfbot-v13');
 const axios = require('axios');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const { createSchedulerDb } = require('./src/scheduler-db');
+const { startLocalApi } = require('./src/local-api');
+const { startScheduler } = require('./src/scheduler');
 
 
-const {
-    token,
-    roleId,
-    globalWebhookUrl,
-    enableHermesAssistant,
-    hermesCommand = 'hermes',
-    hermesSendTarget = 'telegram'
-} = require('./config.js');
-const channelWebhookMap = require('./webhookMap.json');
 const execFileAsync = promisify(execFile);
+const writeFileAsync = promisify(fs.writeFile);
+const unlinkAsync = promisify(fs.unlink);
 
-const client = new Discord.Client();
+function closeServer(server) {
+    return new Promise((resolve, reject) => {
+        server.close(error => error ? reject(error) : resolve());
+    });
+}
 
-client.on('ready', () => {
-    console.log(`Logged in as ${client.user.tag}!`);
-});
+function startSchedulerServices({
+    client,
+    config: schedulerConfig = {},
+    createSchedulerDb: createDb = createSchedulerDb,
+    startScheduler: startSchedulerService = startScheduler,
+    startLocalApi: startApi = startLocalApi
+}) {
+    const {
+        enableLocalApi = true,
+        localApiHost = '127.0.0.1',
+        localApiPort = 3000,
+        schedulerPollMs = 5000,
+        sqlitePath = './data/scheduler.sqlite'
+    } = schedulerConfig;
 
-async function isReplyToSelf(message) {
+    const db = createDb(sqlitePath);
+    const scheduler = startSchedulerService({ db, client, pollMs: schedulerPollMs });
+    const localApiServer = enableLocalApi ? startApi({ db, client, host: localApiHost, port: localApiPort }) : null;
+
+    return {
+        db,
+        scheduler,
+        localApiServer,
+        async cleanup() {
+            let cleanupError;
+            try {
+                await scheduler.stop();
+                if (localApiServer) await closeServer(localApiServer);
+            } catch (error) {
+                cleanupError = error;
+            } finally {
+                db.close();
+            }
+
+            if (cleanupError) throw cleanupError;
+        }
+    };
+}
+
+function createShutdownHandler({ getSchedulerServices, process: processObject = process, console: consoleObject = console }) {
+    let isShuttingDown = false;
+
+    return async function shutdown(signal) {
+        if (isShuttingDown) return;
+        isShuttingDown = true;
+
+        try {
+            const schedulerServices = getSchedulerServices();
+            if (schedulerServices) await schedulerServices.cleanup();
+        } catch (error) {
+            consoleObject.error('Error during shutdown cleanup:', error);
+        } finally {
+            processObject.exit(signal === 'SIGINT' ? 130 : 143);
+        }
+    };
+}
+
+async function isReplyToSelf(message, client, consoleObject = console) {
     if (!message.reference?.messageId) return false;
 
     try {
         const repliedMessage = await message.channel.messages.fetch(message.reference.messageId);
         return repliedMessage.author.id === client.user.id;
     } catch (error) {
-        console.error('Error checking replied message:', error);
+        consoleObject.error('Error checking replied message:', error);
         return false;
     }
 }
@@ -41,10 +95,31 @@ function getMessageUrl(message) {
 
 function getAttachments(message) {
     if (message.attachments.size === 0) return 'None';
-    return message.attachments.map(attachment => attachment.url).join('\n');
+    return message.attachments.map(attachment => {
+        const details = [attachment.name, attachment.contentType, attachment.size ? `${attachment.size} bytes` : null].filter(Boolean).join(', ');
+        return details ? `${attachment.url} (${details})` : attachment.url;
+    }).join('\n');
+}
+
+function getImageAttachments(message) {
+    return Array.from(message.attachments.values()).filter(attachment => {
+        if (attachment.contentType?.startsWith('image/')) return true;
+        return /\.(png|jpe?g|gif|webp)$/i.test(attachment.name || attachment.url || '');
+    });
+}
+
+function getLinks(message) {
+    return message.content.match(/https?:\/\/\S+/g) || [];
+}
+
+function getHermesAck(message, trigger) {
+    const source = message.guild?.id ? `#${message.channel?.name || message.channel.id}` : 'DM';
+    return `Picked up ${trigger} from ${message.author.username} in ${source}. Looking into it...`;
 }
 
 function buildHermesPrompt(message, trigger) {
+    const links = getLinks(message);
+
     return `You are my proactive personal assistant.
 
 I received this Discord message because it mentioned me or replied to one of my messages.
@@ -63,10 +138,17 @@ ${message.content || '[no text content]'}
 Attachments:
 ${getAttachments(message)}
 
+Links:
+${links.length > 0 ? links.join('\n') : 'None'}
+
 Task:
 Help me understand what is happening. If the message is not in English, translate or summarize it in English.
 
 Do background work or research if it would help me understand the situation.
+
+If links are present, inspect and summarize relevant linked information before final update.
+
+If attachments are present, inspect or summarize them when accessible and relevant. Image attachments may be provided directly as image input.
 
 Prepare a concise Telegram update for me with:
 1. Situation
@@ -77,34 +159,80 @@ Prepare a concise Telegram update for me with:
 6. Confidence or missing context`;
 }
 
-async function sendToHermes(message, trigger) {
+async function sendToHermes(message, trigger, config, consoleObject = console) {
+    const {
+        enableHermesAssistant,
+        hermesCommand = 'hermes',
+        hermesSendTarget = 'telegram'
+    } = config;
+
     if (!enableHermesAssistant) return;
 
+    let imagePath = null;
+
     try {
+        await execFileAsync(hermesCommand, ['send', '--to', hermesSendTarget, '--subject', '[Discord]', getHermesAck(message, trigger)], { timeout: 60000, maxBuffer: 1024 * 1024 });
+
         const prompt = buildHermesPrompt(message, trigger);
-        const { stdout } = await execFileAsync(hermesCommand, ['-z', prompt], { timeout: 300000, maxBuffer: 1024 * 1024 });
+        const imageAttachments = getImageAttachments(message);
+        const hermesArgs = imageAttachments.length > 0
+            ? ['chat', '-q', prompt, '--image', await downloadAttachment(imageAttachments[0]), '-Q', '--source', 'tool']
+            : ['-z', prompt];
+
+        imagePath = hermesArgs.includes('--image') ? hermesArgs[hermesArgs.indexOf('--image') + 1] : null;
+
+        const { stdout } = await execFileAsync(hermesCommand, hermesArgs, { timeout: 300000, maxBuffer: 1024 * 1024 });
         const response = stdout.trim();
 
         if (!response) return;
 
         await execFileAsync(hermesCommand, ['send', '--to', hermesSendTarget, '--subject', '[Discord]', response], { timeout: 60000, maxBuffer: 1024 * 1024 });
-        console.log(`Hermes assistant processed message ${message.id}.`);
+        consoleObject.log(`Hermes assistant processed message ${message.id}.`);
     } catch (error) {
-        console.error('Error sending message to Hermes:', error);
+        consoleObject.error('Error sending message to Hermes:', error);
+    } finally {
+        if (imagePath) {
+            unlinkAsync(imagePath).catch(cleanupError => consoleObject.error('Error cleaning up Hermes image:', cleanupError));
+        }
     }
 }
 
-client.on('messageCreate', async (message) => {
+async function downloadAttachment(attachment) {
+    const response = await axios.get(attachment.url, { responseType: 'arraybuffer' });
+    const extension = path.extname(attachment.name || '') || '.img';
+    const filePath = path.join(os.tmpdir(), `discord-hermes-${attachment.id}-${Date.now()}${extension}`);
+
+    await writeFileAsync(filePath, response.data);
+    return filePath;
+}
+
+function attachClientHandlers({ client, config, channelWebhookMap, console: consoleObject = console }) {
+    let schedulerServices;
+    const {
+        roleId,
+        globalWebhookUrl,
+    } = config;
+
+    client.on('ready', () => {
+        consoleObject.log(`Logged in as ${client.user.tag}!`);
+        if (!schedulerServices) {
+            schedulerServices = startSchedulerServices({ client, config });
+        }
+    });
+
+    client.on('messageCreate', async (message) => {
     const webhookUrl = channelWebhookMap[message.channel.id];
+    const isDm = !message.guild;
+    const isFromSelf = message.author.id === client.user.id;
     const mentionedSelf = message.mentions.users.has(client.user.id);
-    const repliedToSelf = await isReplyToSelf(message);
-    const trigger = mentionedSelf && repliedToSelf ? 'mention_and_reply' : mentionedSelf ? 'mention' : repliedToSelf ? 'reply' : null;
+    const repliedToSelf = await isReplyToSelf(message, client, consoleObject);
+    const trigger = isDm && !isFromSelf ? 'dm' : mentionedSelf && repliedToSelf ? 'mention_and_reply' : mentionedSelf ? 'mention' : repliedToSelf ? 'reply' : null;
     const shouldForwardToGlobal = !webhookUrl
         && globalWebhookUrl
         && trigger;
 
     if (trigger) {
-        sendToHermes(message, trigger);
+        sendToHermes(message, trigger, config, consoleObject);
     }
 
     if (webhookUrl || shouldForwardToGlobal) {
@@ -159,11 +287,60 @@ client.on('messageCreate', async (message) => {
             };
 
             await axios.post(webhookUrl || globalWebhookUrl, payload);
-            console.log(`Message from ${message.author.username} in channel ${message.channel.id} forwarded.`);
+            consoleObject.log(`Message from ${message.author.username} in channel ${message.channel.id} forwarded.`);
         } catch (error) {
-            console.error('Error sending message through webhook:', error);
+            consoleObject.error('Error sending message through webhook:', error);
         }
     }
 });
 
-client.login(token);
+    return {
+        getSchedulerServices() {
+            return schedulerServices;
+        }
+    };
+}
+
+async function loginClient({ client, token, console: consoleObject = console, process: processObject = process }) {
+    try {
+        await client.login(token);
+    } catch (error) {
+        consoleObject.error('Discord login failed:', error);
+        processObject.exit(1);
+    }
+}
+
+function main({
+    Discord = require('discord.js-selfbot-v13'),
+    config = require('./config.js'),
+    channelWebhookMap = require('./webhookMap.json'),
+    process: processObject = process,
+    console: consoleObject = console,
+} = {}) {
+    const { token } = config;
+    const client = new Discord.Client();
+    const runtime = attachClientHandlers({ client, config, channelWebhookMap, console: consoleObject });
+    const shutdown = createShutdownHandler({
+        getSchedulerServices: runtime.getSchedulerServices,
+        process: processObject,
+        console: consoleObject,
+    });
+
+    processObject.on('SIGINT', () => shutdown('SIGINT'));
+    processObject.on('SIGTERM', () => shutdown('SIGTERM'));
+    loginClient({ client, token, console: consoleObject, process: processObject });
+
+    return { client, runtime, shutdown };
+}
+
+if (require.main === module) {
+    main();
+}
+
+module.exports = {
+    attachClientHandlers,
+    createShutdownHandler,
+    loginClient,
+    main,
+    startSchedulerServices,
+};

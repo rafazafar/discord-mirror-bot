@@ -4,6 +4,7 @@
   "description": "Discord message mirroring bot",
   "main": "mirror.js",
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "start": "node mirror.js",
     "pm2:start": "pm2 start ecosystem.config.js",
     "pm2:stop": "pm2 stop discord-mirror",
@@ -18,7 +19,9 @@
   },
   "dependencies": {
     "axios": "^1.8.4",
+    "better-sqlite3": "^12.10.0",
     "discord.js-selfbot-v13": "^3.6.1",
+    "express": "^5.2.1",
     "fs": "^0.0.1-security",
     "pm2": "^6.0.5"
   }

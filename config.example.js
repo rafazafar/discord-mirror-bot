@@ -5,5 +5,10 @@ module.exports = {
     globalWebhookUrl: 'YOUR_GLOBAL_WEBHOOK_URL_HERE',
     enableHermesAssistant: false,
     hermesCommand: 'hermes',
-    hermesSendTarget: 'telegram'
+    hermesSendTarget: 'telegram',
+    enableLocalApi: true,
+    localApiHost: '127.0.0.1',
+    localApiPort: 3000,
+    schedulerPollMs: 5000,
+    sqlitePath: './data/scheduler.sqlite'
 };
